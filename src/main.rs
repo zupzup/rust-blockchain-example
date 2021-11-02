@@ -11,72 +11,46 @@ struct Block {
     pub hash: String,
     pub previous_hash: String,
     pub timestamp: i64,
-    pub transactions: Vec<Transaction>,
+    pub data: String,
 }
 
 impl Block {
-    pub fn new(id: u64, previous_hash: String, transactions: Vec<Transaction>) -> Self {
+    pub fn new(id: u64, previous_hash: String, data: String) -> Self {
         let now = Utc::now();
-        let hash = calculate_hash(id, now.timestamp(), &previous_hash, &transactions);
+        let hash = calculate_hash(id, now.timestamp(), &previous_hash, &data);
         Self {
             id,
             hash,
             timestamp: now.timestamp(),
             previous_hash,
-            transactions,
+            data,
         }
     }
 }
 
-fn calculate_hash(
-    id: u64,
-    timestamp: i64,
-    previous_hash: &str,
-    transactions: &Vec<Transaction>,
-) -> String {
+fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> String {
     let data = serde_json::json!({
         "id": id,
         "previous_hash": previous_hash,
-        "transactions": transactions,
+        "data": data,
         "timestamp": timestamp
     });
     // println!("block data: {}", data.to_string());
     hex_digest(Algorithm::SHA256, data.to_string().as_bytes())
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Transaction {
-    pub id: String,
-    pub data: String,
-    pub timestamp: i64,
-    pub creator: Creator,
-}
-
-impl Transaction {
-    pub fn new(data: String, creator: Creator) -> Self {
-        Self {
-            id: Uuid::new_v4().to_string(),
-            data,
-            timestamp: Utc::now().timestamp(),
-            creator,
-        }
-    }
-}
-
 struct App {
     pub node_id: String,
     pub nodes: Vec<String>,
-    pub current_transactions: Vec<Transaction>,
     pub blocks: Vec<Block>,
 }
 
 impl App {
     fn genesis() -> Self {
-        let genesis_block = Block::new(0, String::from("genesis"), vec![]);
+        let genesis_block = Block::new(0, String::from("genesis"), String::from("genesis!"));
         Self {
             node_id: Uuid::new_v4().to_string(),
             nodes: vec![],
-            current_transactions: vec![],
             blocks: vec![genesis_block],
         }
     }
@@ -84,10 +58,11 @@ impl App {
     fn generate_new_block(&mut self) {
         let latest_block = self.blocks.last().expect("there is at least one block");
 
-        let mut transactions = vec![];
-        transactions.append(&mut self.current_transactions); // move current transactions over to this block
-
-        let block = Block::new(latest_block.id + 1, latest_block.hash.clone(), transactions);
+        let block = Block::new(
+            latest_block.id + 1,
+            latest_block.hash.clone(),
+            String::from("new block data!"),
+        );
         self.blocks.push(block);
     }
 
@@ -97,16 +72,23 @@ impl App {
             return false;
         } else if block.id != latest_block.id + 1 {
             return false;
-        } else if calculate_hash(
-            block.id,
-            block.timestamp,
-            &block.previous_hash,
-            &block.transactions,
-        ) != block.hash
+        } else if calculate_hash(block.id, block.timestamp, &block.previous_hash, &block.data)
+            != block.hash
         {
             return false;
         }
         true
+    }
+
+    fn is_chain_valid(&mut self, chain: &Vec<Block>) -> bool {
+        // TODO
+        true
+    }
+
+    fn choose_longer_chain(&mut self, local: &Vec<Block>, remote: &Vec<Block>) {
+        // TODO: choose the longer chain
+        // validate both chains
+        // choose chain with bigger height (i.e. where len() is bigger)
     }
 }
 
@@ -114,23 +96,19 @@ fn main() {
     let mut app = App::genesis();
     println!("Started a node with id: {}", app.node_id);
 
-    app.current_transactions
-        .push(Transaction::new(String::from("test1"), app.node_id.clone()));
-
     app.generate_new_block();
-    app.current_transactions
-        .push(Transaction::new(String::from("test2"), app.node_id.clone()));
-    app.current_transactions
-        .push(Transaction::new(String::from("test3"), app.node_id.clone()));
     app.generate_new_block();
     app.generate_new_block();
 
-    let is_block_valid = app.is_block_valid(&Block::new(12, String::from("yay"), vec![]));
+    let is_block_valid = app.is_block_valid(&Block::new(
+        12,
+        String::from("yay"),
+        String::from("yay block"),
+    ));
     println!("block valid: {}", is_block_valid);
 
     let serialized_chain = serde_json::to_string_pretty(&app.blocks).expect("serialize blocks");
 
     println!("Blocks: {}", serialized_chain);
     println!("connected nodes: {:?}", app.nodes);
-    println!("current transactions: {:?}", app.current_transactions);
 }
