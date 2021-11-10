@@ -2,26 +2,23 @@ use chrono::prelude::*;
 use crypto_hash::{digest, Algorithm};
 use libp2p::{
     core::upgrade,
-    floodsub::Floodsub,
     futures::StreamExt,
-    mdns::Mdns,
     mplex,
     noise::{Keypair, NoiseConfig, X25519Spec},
     swarm::{Swarm, SwarmBuilder},
     tcp::TokioTcpConfig,
     Transport,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncBufReadExt, sync::mpsc};
-use uuid::Uuid;
 
 const DIFFICULTY_PREFIX: &str = "00";
 
 mod p2p;
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Block {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Block {
     pub id: u64,
     pub hash: String,
     pub previous_hash: String,
@@ -88,14 +85,16 @@ fn hash_to_binary_representation(hash: &Vec<u8>) -> String {
     res
 }
 
-struct App {
-    pub node_id: String,
-    pub nodes: Vec<String>,
+pub struct App {
     pub blocks: Vec<Block>,
 }
 
 impl App {
-    fn genesis() -> Self {
+    fn new() -> Self {
+        Self { blocks: vec![] }
+    }
+
+    fn genesis(&mut self) {
         let genesis_block = Block {
             id: 0,
             timestamp: Utc::now().timestamp(),
@@ -104,35 +103,34 @@ impl App {
             nonce: 2836,
             hash: "0000f816a87f806bb0073dcf026a64fb40c946b5abee2573702828694d5b4c43".to_string(),
         };
-        Self {
-            node_id: Uuid::new_v4().to_string(),
-            nodes: vec![],
-            blocks: vec![genesis_block],
+        self.blocks.push(genesis_block);
+    }
+
+    fn try_add_block(&mut self, block: Block) {
+        let latest_block = self.blocks.last().expect("there is at least one block");
+        if self.is_block_valid(&block, &latest_block) {
+            self.blocks.push(block);
+        } else {
+            error!("could not add block - invalid");
         }
     }
 
-    fn generate_new_block(&mut self) {
-        let latest_block = self.blocks.last().expect("there is at least one block");
-
-        let block = Block::new(
-            latest_block.id + 1,
-            latest_block.hash.clone(),
-            String::from("new block data!"),
-        );
-        self.blocks.push(block);
-    }
-
-    fn is_block_valid(&self, block: &Block) -> bool {
-        let latest_block = self.blocks.last().expect("there is at least one block");
-        if block.previous_hash != latest_block.hash {
+    fn is_block_valid(&self, block: &Block, previous_block: &Block) -> bool {
+        if block.previous_hash != previous_block.hash {
+            warn!("block with id: {} has wrong previous hash", block.id);
             return false;
         } else if !hash_to_binary_representation(
             &hex::decode(&block.hash).expect("can decode from hex"),
         )
         .starts_with(DIFFICULTY_PREFIX)
         {
+            warn!("block with id: {} has invalid difficulty", block.id);
             return false;
-        } else if block.id != latest_block.id + 1 {
+        } else if block.id != previous_block.id + 1 {
+            warn!(
+                "block with id: {} is not the next block after the latest: {}",
+                block.id, previous_block.id
+            );
             return false;
         } else if hex::encode(calculate_hash(
             block.id,
@@ -142,13 +140,24 @@ impl App {
             block.nonce,
         )) != block.hash
         {
+            warn!("block with id: {} has invalid hash", block.id);
             return false;
         }
         true
     }
 
     fn is_chain_valid(&self, chain: &Vec<Block>) -> bool {
-        chain.iter().all(|b| self.is_block_valid(b))
+        for i in 0..chain.len() {
+            if i == 0 {
+                continue;
+            }
+            let first = chain.get(i - 1).expect("has to exist");
+            let second = chain.get(i).expect("has to exist");
+            if !self.is_block_valid(second, first) {
+                return false;
+            }
+        }
+        true
     }
 
     // We always choose the longest valid chain
@@ -175,28 +184,10 @@ impl App {
 async fn main() {
     pretty_env_logger::init();
 
-    let mut app = App::genesis();
-    println!("Started a node with id: {}", app.node_id);
-
-    app.generate_new_block();
-    let latest_block = app.blocks.last().expect("there is a block");
-    app.is_block_valid(&latest_block);
-
-    // let is_block_valid = app.is_block_valid(&Block::new(
-    //     12,
-    //     String::from("yay"),
-    //     String::from("yay block"),
-    // ));
-    // println!("block valid: {}", is_block_valid);
-
-    let serialized_chain = serde_json::to_string_pretty(&app.blocks).expect("serialize blocks");
-
-    println!("Blocks: {}", serialized_chain);
-    println!("connected nodes: {:?}", app.nodes);
-
     // -------------------------------------------- p2p stuff
     info!("Peer Id: {}", p2p::PEER_ID.clone());
     let (response_sender, mut response_rcv) = mpsc::unbounded_channel();
+    let (init_sender, mut init_rcv) = mpsc::unbounded_channel();
 
     let auth_keys = Keypair::<X25519Spec>::new()
         .into_authentic(&p2p::KEYS)
@@ -208,15 +199,7 @@ async fn main() {
         .multiplex(mplex::MplexConfig::new())
         .boxed();
 
-    let mut behaviour = p2p::AppBehaviour {
-        floodsub: Floodsub::new(p2p::PEER_ID.clone()),
-        mdns: Mdns::new(Default::default())
-            .await
-            .expect("can create mdns"),
-        response_sender,
-    };
-
-    behaviour.floodsub.subscribe(p2p::TOPIC.clone());
+    let behaviour = p2p::AppBehaviour::new(App::new(), response_sender, init_sender.clone()).await;
 
     let mut swarm = SwarmBuilder::new(transp, behaviour, p2p::PEER_ID.clone())
         .executor(Box::new(|fut| {
@@ -234,11 +217,22 @@ async fn main() {
     )
     .expect("swarm can be started");
 
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        info!("sending init event");
+        init_sender.send(true).expect("can send init event");
+    });
+
     loop {
         let evt = {
             tokio::select! {
                 line = stdin.next_line() => Some(p2p::EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
-                response = response_rcv.recv() => Some(p2p::EventType::Response(response.expect("response exists"))),
+                response = response_rcv.recv() => {
+                    Some(p2p::EventType::LocalChainResponse(response.expect("response exists")))
+                },
+                _init = init_rcv.recv() => {
+                    Some(p2p::EventType::Init)
+                }
                 event = swarm.select_next_some() => {
                     info!("Unhandled Swarm Event: {:?}", event);
                     None
@@ -248,20 +242,45 @@ async fn main() {
 
         if let Some(event) = evt {
             match event {
-                p2p::EventType::Response(resp) => {
+                p2p::EventType::Init => {
+                    let b = swarm.behaviour_mut();
+                    b.app.genesis();
+
+                    let nodes = b.mdns.discovered_nodes();
+                    let mut unique_peers = std::collections::HashSet::new();
+                    for peer in nodes {
+                        unique_peers.insert(peer);
+                    }
+                    info!("connected nodes: {}", unique_peers.len());
+                    // TODO: IF nodes > 0, send out request for getting chain
+                    if !unique_peers.is_empty() {
+                        let req = p2p::LocalChainRequest {
+                            from_peer_id: unique_peers
+                                .iter()
+                                .last()
+                                .expect("at least one peer")
+                                .to_string(),
+                        };
+                        let json = serde_json::to_string(&req).expect("can jsonify request");
+                        swarm
+                            .behaviour_mut()
+                            .floodsub
+                            .publish(p2p::CHAIN_TOPIC.clone(), json.as_bytes());
+                    }
+                }
+                p2p::EventType::LocalChainResponse(resp) => {
                     let json = serde_json::to_string(&resp).expect("can jsonify response");
                     swarm
                         .behaviour_mut()
                         .floodsub
-                        .publish(p2p::TOPIC.clone(), json.as_bytes());
+                        .publish(p2p::CHAIN_TOPIC.clone(), json.as_bytes());
                 }
                 p2p::EventType::Input(line) => match line.as_str() {
-                    "ls p" => p2p::handle_list_peers(&mut swarm).await,
-                    cmd if cmd.starts_with("ls r") => {
-                        p2p::handle_list_recipes(cmd, &mut swarm).await
+                    "ls p" => p2p::handle_list_peers(&swarm).await,
+                    cmd if cmd.starts_with("ls c") => p2p::handle_print_chain(&swarm).await,
+                    cmd if cmd.starts_with("create b") => {
+                        p2p::handle_create_block(cmd, &mut swarm).await
                     }
-                    cmd if cmd.starts_with("create r") => p2p::handle_create_recipe(cmd).await,
-                    cmd if cmd.starts_with("publish r") => p2p::handle_publish_recipe(cmd).await,
                     _ => error!("unknown command"),
                 },
             }

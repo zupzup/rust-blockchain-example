@@ -1,3 +1,4 @@
+use super::{App, Block};
 use libp2p::{
     floodsub::{Floodsub, FloodsubEvent, Topic},
     identity,
@@ -13,31 +14,24 @@ use tokio::sync::mpsc;
 
 pub static KEYS: Lazy<identity::Keypair> = Lazy::new(|| identity::Keypair::generate_ed25519());
 pub static PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(KEYS.public()));
-pub static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("blocks"));
-
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
+pub static CHAIN_TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("chains"));
+pub static BLOCK_TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("blocks"));
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ListMode {
-    ALL,
-    One(String),
+pub struct ChainResponse {
+    pub blocks: Vec<Block>,
+    pub receiver: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ListRequest {
-    mode: ListMode,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListResponse {
-    mode: ListMode,
-    data: Vec<String>,
-    receiver: String,
+pub struct LocalChainRequest {
+    pub from_peer_id: String,
 }
 
 pub enum EventType {
-    Response(ListResponse),
+    LocalChainResponse(ChainResponse),
     Input(String),
+    Init,
 }
 
 #[derive(NetworkBehaviour)]
@@ -45,60 +39,65 @@ pub struct AppBehaviour {
     pub floodsub: Floodsub,
     pub mdns: Mdns,
     #[behaviour(ignore)]
-    pub response_sender: mpsc::UnboundedSender<ListResponse>,
+    pub response_sender: mpsc::UnboundedSender<ChainResponse>,
+    #[behaviour(ignore)]
+    pub init_sender: mpsc::UnboundedSender<bool>,
+    #[behaviour(ignore)]
+    pub app: App,
 }
 
+impl AppBehaviour {
+    pub async fn new(
+        app: App,
+        response_sender: mpsc::UnboundedSender<ChainResponse>,
+        init_sender: mpsc::UnboundedSender<bool>,
+    ) -> Self {
+        let mut behaviour = Self {
+            app,
+            floodsub: Floodsub::new(PEER_ID.clone()),
+            mdns: Mdns::new(Default::default())
+                .await
+                .expect("can create mdns"),
+            response_sender,
+            init_sender,
+        };
+        behaviour.floodsub.subscribe(CHAIN_TOPIC.clone());
+        behaviour.floodsub.subscribe(BLOCK_TOPIC.clone());
+
+        behaviour
+    }
+}
+
+// incoming event handler
 impl NetworkBehaviourEventProcess<FloodsubEvent> for AppBehaviour {
     fn inject_event(&mut self, event: FloodsubEvent) {
         match event {
             FloodsubEvent::Message(msg) => {
-                if let Ok(resp) = serde_json::from_slice::<ListResponse>(&msg.data) {
+                if let Ok(resp) = serde_json::from_slice::<ChainResponse>(&msg.data) {
                     if resp.receiver == PEER_ID.to_string() {
                         info!("Response from {}:", msg.source);
-                        resp.data.iter().for_each(|r| info!("{:?}", r));
+                        resp.blocks.iter().for_each(|r| info!("{:?}", r));
+                        let remote_blocks = resp.blocks;
+                        let local_blocks = self.app.blocks.clone();
+                        self.app.blocks = self.app.choose_chain(local_blocks, remote_blocks);
                     }
-                } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
-                    match req.mode {
-                        ListMode::ALL => {
-                            info!("Received ALL req: {:?} from {:?}", req, msg.source);
-                            respond_with_public_recipes(
-                                self.response_sender.clone(),
-                                msg.source.to_string(),
-                            );
-                        }
-                        ListMode::One(ref peer_id) => {
-                            if peer_id == &PEER_ID.to_string() {
-                                info!("Received req: {:?} from {:?}", req, msg.source);
-                                respond_with_public_recipes(
-                                    self.response_sender.clone(),
-                                    msg.source.to_string(),
-                                );
-                            }
+                } else if let Ok(resp) = serde_json::from_slice::<LocalChainRequest>(&msg.data) {
+                    let peer_id = resp.from_peer_id;
+                    if PEER_ID.to_string() == peer_id {
+                        if let Err(e) = self.response_sender.send(ChainResponse {
+                            blocks: self.app.blocks.clone(),
+                            receiver: msg.source.to_string(),
+                        }) {
+                            error!("error sending response via channel, {}", e);
                         }
                     }
+                } else if let Ok(block) = serde_json::from_slice::<Block>(&msg.data) {
+                    self.app.try_add_block(block);
                 }
             }
             _ => (),
         }
     }
-}
-
-pub fn respond_with_public_recipes(sender: mpsc::UnboundedSender<ListResponse>, receiver: String) {
-    tokio::spawn(async move {
-        match read_local_recipes().await {
-            Ok(recipes) => {
-                let resp = ListResponse {
-                    mode: ListMode::ALL,
-                    receiver,
-                    data: recipes,
-                };
-                if let Err(e) = sender.send(resp) {
-                    error!("error sending response via channel, {}", e);
-                }
-            }
-            Err(e) => error!("error fetching local recipes to answer ALL request, {}", e),
-        }
-    });
 }
 
 impl NetworkBehaviourEventProcess<MdnsEvent> for AppBehaviour {
@@ -120,34 +119,7 @@ impl NetworkBehaviourEventProcess<MdnsEvent> for AppBehaviour {
     }
 }
 
-pub async fn create_new_recipe(name: &str, ingredients: &str, instructions: &str) -> Result<()> {
-    let mut local_recipes = read_local_recipes().await?;
-    local_recipes.push(String::default());
-    write_local_recipes(&local_recipes).await?;
-
-    info!("Created recipe:");
-    info!("Name: {}", name);
-    info!("Ingredients: {}", ingredients);
-    info!("Instructions:: {}", instructions);
-
-    Ok(())
-}
-
-pub async fn publish_recipe(_id: usize) -> Result<()> {
-    let local_recipes = read_local_recipes().await?;
-    write_local_recipes(&local_recipes).await?;
-    Ok(())
-}
-
-pub async fn read_local_recipes() -> Result<Vec<String>> {
-    Ok(vec![])
-}
-
-pub async fn write_local_recipes(_recipes: &Vec<String>) -> Result<()> {
-    Ok(())
-}
-
-pub async fn handle_list_peers(swarm: &mut Swarm<AppBehaviour>) {
+pub async fn handle_list_peers(swarm: &Swarm<AppBehaviour>) {
     info!("Discovered Peers:");
     let nodes = swarm.behaviour().mdns.discovered_nodes();
     let mut unique_peers = HashSet::new();
@@ -157,68 +129,30 @@ pub async fn handle_list_peers(swarm: &mut Swarm<AppBehaviour>) {
     unique_peers.iter().for_each(|p| info!("{}", p));
 }
 
-pub async fn handle_list_recipes(cmd: &str, swarm: &mut Swarm<AppBehaviour>) {
-    let rest = cmd.strip_prefix("ls r ");
-    match rest {
-        Some("all") => {
-            let req = ListRequest {
-                mode: ListMode::ALL,
-            };
-            let json = serde_json::to_string(&req).expect("can jsonify request");
-            swarm
-                .behaviour_mut()
-                .floodsub
-                .publish(TOPIC.clone(), json.as_bytes());
-        }
-        Some(recipes_peer_id) => {
-            let req = ListRequest {
-                mode: ListMode::One(recipes_peer_id.to_owned()),
-            };
-            let json = serde_json::to_string(&req).expect("can jsonify request");
-            swarm
-                .behaviour_mut()
-                .floodsub
-                .publish(TOPIC.clone(), json.as_bytes());
-        }
-        None => {
-            match read_local_recipes().await {
-                Ok(v) => {
-                    info!("Local Recipes ({})", v.len());
-                    v.iter().for_each(|r| info!("{:?}", r));
-                }
-                Err(e) => error!("error fetching local recipes: {}", e),
-            };
-        }
-    };
+pub async fn handle_print_chain(swarm: &Swarm<AppBehaviour>) {
+    info!("Local Blockchain:");
+    let pretty_json =
+        serde_json::to_string_pretty(&swarm.behaviour().app.blocks).expect("can jsonify blocks");
+    info!("{}", pretty_json);
 }
 
-pub async fn handle_create_recipe(cmd: &str) {
-    if let Some(rest) = cmd.strip_prefix("create r") {
-        let elements: Vec<&str> = rest.split("|").collect();
-        if elements.len() < 3 {
-            info!("too few arguments - Format: name|ingredients|instructions");
-        } else {
-            let name = elements.get(0).expect("name is there");
-            let ingredients = elements.get(1).expect("ingredients is there");
-            let instructions = elements.get(2).expect("instructions is there");
-            if let Err(e) = create_new_recipe(name, ingredients, instructions).await {
-                error!("error creating recipe: {}", e);
-            };
-        }
-    }
-}
-
-pub async fn handle_publish_recipe(cmd: &str) {
-    if let Some(rest) = cmd.strip_prefix("publish r") {
-        match rest.trim().parse::<usize>() {
-            Ok(id) => {
-                if let Err(e) = publish_recipe(id).await {
-                    info!("error publishing recipe with id {}, {}", id, e)
-                } else {
-                    info!("Published Recipe with id: {}", id);
-                }
-            }
-            Err(e) => error!("invalid id: {}, {}", rest.trim(), e),
-        };
+pub async fn handle_create_block(cmd: &str, swarm: &mut Swarm<AppBehaviour>) {
+    if let Some(data) = cmd.strip_prefix("create b") {
+        let behaviour = swarm.behaviour_mut();
+        let latest_block = behaviour
+            .app
+            .blocks
+            .last()
+            .expect("there is at least one block");
+        let block = Block::new(
+            latest_block.id + 1,
+            latest_block.hash.clone(),
+            data.to_owned(),
+        );
+        let json = serde_json::to_string(&block).expect("can jsonify request");
+        behaviour.app.blocks.push(block);
+        behaviour
+            .floodsub
+            .publish(BLOCK_TOPIC.clone(), json.as_bytes());
     }
 }
