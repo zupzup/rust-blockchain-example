@@ -11,11 +11,21 @@ use libp2p::{
 };
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncBufReadExt, sync::mpsc};
+use std::time::Duration;
+use tokio::{
+    io::{stdin, AsyncBufReadExt, BufReader},
+    select, spawn,
+    sync::mpsc,
+    time::sleep,
+};
 
 const DIFFICULTY_PREFIX: &str = "00";
 
 mod p2p;
+
+pub struct App {
+    pub blocks: Vec<Block>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Block {
@@ -77,16 +87,12 @@ fn mine_block(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> (u64,
     }
 }
 
-fn hash_to_binary_representation(hash: &Vec<u8>) -> String {
+fn hash_to_binary_representation(hash: &[u8]) -> String {
     let mut res: String = String::default();
     for c in hash {
         res.push_str(&format!("{:b}", c));
     }
     res
-}
-
-pub struct App {
-    pub blocks: Vec<Block>,
 }
 
 impl App {
@@ -108,7 +114,7 @@ impl App {
 
     fn try_add_block(&mut self, block: Block) {
         let latest_block = self.blocks.last().expect("there is at least one block");
-        if self.is_block_valid(&block, &latest_block) {
+        if self.is_block_valid(&block, latest_block) {
             self.blocks.push(block);
         } else {
             error!("could not add block - invalid");
@@ -146,7 +152,7 @@ impl App {
         true
     }
 
-    fn is_chain_valid(&self, chain: &Vec<Block>) -> bool {
+    fn is_chain_valid(&self, chain: &[Block]) -> bool {
         for i in 0..chain.len() {
             if i == 0 {
                 continue;
@@ -166,25 +172,25 @@ impl App {
         let is_remote_valid = self.is_chain_valid(&remote);
 
         if is_local_valid && is_remote_valid {
-            return if local.len() >= remote.len() {
+            if local.len() >= remote.len() {
                 local
             } else {
                 remote
-            };
+            }
         } else if is_remote_valid && !is_local_valid {
-            return remote;
+            remote
         } else if !is_remote_valid && is_local_valid {
-            return local;
+            local
         } else {
             panic!("local and remote chains are both invalid");
         }
     }
 }
+
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
 
-    // -------------------------------------------- p2p stuff
     info!("Peer Id: {}", p2p::PEER_ID.clone());
     let (response_sender, mut response_rcv) = mpsc::unbounded_channel();
     let (init_sender, mut init_rcv) = mpsc::unbounded_channel();
@@ -195,19 +201,19 @@ async fn main() {
 
     let transp = TokioTcpConfig::new()
         .upgrade(upgrade::Version::V1)
-        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated()) // XX Handshake pattern, IX exists as well and IK - only XX currently provides interop with other libp2p impls
+        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated())
         .multiplex(mplex::MplexConfig::new())
         .boxed();
 
     let behaviour = p2p::AppBehaviour::new(App::new(), response_sender, init_sender.clone()).await;
 
-    let mut swarm = SwarmBuilder::new(transp, behaviour, p2p::PEER_ID.clone())
+    let mut swarm = SwarmBuilder::new(transp, behaviour, *p2p::PEER_ID)
         .executor(Box::new(|fut| {
-            tokio::spawn(fut);
+            spawn(fut);
         }))
         .build();
 
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = BufReader::new(stdin()).lines();
 
     Swarm::listen_on(
         &mut swarm,
@@ -217,15 +223,15 @@ async fn main() {
     )
     .expect("swarm can be started");
 
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    spawn(async move {
+        sleep(Duration::from_secs(1)).await;
         info!("sending init event");
         init_sender.send(true).expect("can send init event");
     });
 
     loop {
         let evt = {
-            tokio::select! {
+            select! {
                 line = stdin.next_line() => Some(p2p::EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
                 response = response_rcv.recv() => {
                     Some(p2p::EventType::LocalChainResponse(response.expect("response exists")))
@@ -243,24 +249,19 @@ async fn main() {
         if let Some(event) = evt {
             match event {
                 p2p::EventType::Init => {
-                    let b = swarm.behaviour_mut();
-                    b.app.genesis();
+                    let peers = p2p::get_list_peers(&swarm);
+                    swarm.behaviour_mut().app.genesis();
 
-                    let nodes = b.mdns.discovered_nodes();
-                    let mut unique_peers = std::collections::HashSet::new();
-                    for peer in nodes {
-                        unique_peers.insert(peer);
-                    }
-                    info!("connected nodes: {}", unique_peers.len());
-                    // TODO: IF nodes > 0, send out request for getting chain
-                    if !unique_peers.is_empty() {
+                    info!("connected nodes: {}", peers.len());
+                    if !peers.is_empty() {
                         let req = p2p::LocalChainRequest {
-                            from_peer_id: unique_peers
+                            from_peer_id: peers
                                 .iter()
                                 .last()
                                 .expect("at least one peer")
                                 .to_string(),
                         };
+
                         let json = serde_json::to_string(&req).expect("can jsonify request");
                         swarm
                             .behaviour_mut()
@@ -276,11 +277,9 @@ async fn main() {
                         .publish(p2p::CHAIN_TOPIC.clone(), json.as_bytes());
                 }
                 p2p::EventType::Input(line) => match line.as_str() {
-                    "ls p" => p2p::handle_list_peers(&swarm).await,
-                    cmd if cmd.starts_with("ls c") => p2p::handle_print_chain(&swarm).await,
-                    cmd if cmd.starts_with("create b") => {
-                        p2p::handle_create_block(cmd, &mut swarm).await
-                    }
+                    "ls p" => p2p::handle_print_peers(&swarm),
+                    cmd if cmd.starts_with("ls c") => p2p::handle_print_chain(&swarm),
+                    cmd if cmd.starts_with("create b") => p2p::handle_create_block(cmd, &mut swarm),
                     _ => error!("unknown command"),
                 },
             }
