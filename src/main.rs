@@ -60,7 +60,6 @@ fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str, nonc
         "timestamp": timestamp,
         "nonce": nonce
     });
-    // println!("block data: {}", data.to_string());
     digest(Algorithm::SHA256, data.to_string().as_bytes())
 }
 
