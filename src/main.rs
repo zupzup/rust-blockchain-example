@@ -66,17 +66,17 @@ fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str, nonc
 }
 
 fn mine_block(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> (u64, String) {
-    println!("mining block...");
+    info!("mining block...");
     let mut nonce = 0;
 
     loop {
         if nonce % 100000 == 0 {
-            println!("nonce: {}", nonce);
+            info!("nonce: {}", nonce);
         }
         let hash = calculate_hash(id, timestamp, previous_hash, data, nonce);
         let binary_hash = hash_to_binary_representation(&hash);
         if binary_hash.starts_with(DIFFICULTY_PREFIX) {
-            println!(
+            info!(
                 "mined! nonce: {}, hash: {}, binary hash: {}",
                 nonce,
                 hex::encode(&hash),
