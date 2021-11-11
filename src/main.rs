@@ -1,5 +1,4 @@
 use chrono::prelude::*;
-use crypto_hash::{digest, Algorithm};
 use libp2p::{
     core::upgrade,
     futures::StreamExt,
@@ -11,6 +10,7 @@ use libp2p::{
 };
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::{
     io::{stdin, AsyncBufReadExt, BufReader},
@@ -60,7 +60,9 @@ fn calculate_hash(id: u64, timestamp: i64, previous_hash: &str, data: &str, nonc
         "timestamp": timestamp,
         "nonce": nonce
     });
-    digest(Algorithm::SHA256, data.to_string().as_bytes())
+    let mut hasher = Sha256::new();
+    hasher.update(data.to_string().as_bytes());
+    hasher.finalize().as_slice().to_owned()
 }
 
 fn mine_block(id: u64, timestamp: i64, previous_hash: &str, data: &str) -> (u64, String) {
